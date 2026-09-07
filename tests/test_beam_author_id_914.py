@@ -1,0 +1,215 @@
+"""Regression tests for issue #914 — per-write author stamps.
+
+Covers the two core bugs fixed on the dev branch:
+  1. ``BeamMemory.remember()`` accepts per-write ``author_id`` / ``author_type``
+     overrides so integrations (Hermes provider surfaces) can stamp rows
+     without setting ``beam.author_id`` (keeping recall/prefetch session-
+     scoped).
+  2. ``consolidate_to_episodic()`` and ``sleep()`` preserve the row-level
+     author stamp instead of copying the beam identity: the source SELECT
+     fetches author columns and the summary inherits the unanimous
+     source-row author (mixed/absent falls back to beam identity).
+"""
+
+import os
+import sqlite3
+import tempfile
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+from mnemosyne.core.beam import BeamMemory
+
+
+@pytest.fixture
+def temp_db():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        yield Path(tmpdir) / "test.db"
+
+
+def _wm_author(db_path, memory_id):
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute(
+            "SELECT author_id, author_type FROM working_memory WHERE id = ?",
+            (memory_id,),
+        ).fetchone()
+        return tuple(row) if row is not None else None
+    finally:
+        conn.close()
+
+
+def _ep_author(db_path):
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute(
+            "SELECT author_id, author_type FROM episodic_memory ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        return tuple(row) if row is not None else None
+    finally:
+        conn.close()
+
+
+def _seed_old_wm(beam, rows, ts_offset_hours=200):
+    """Insert old working_memory rows with explicit authors (bypasses
+    remember() so the write-side path under test is exercised from the
+    other side / consolidation only)."""
+    conn = sqlite3.connect(str(beam.db_path))
+    ts = (datetime.now() - timedelta(hours=ts_offset_hours)).isoformat()
+    data = [
+        (rid, content, source, ts, beam.session_id, author, author_type)
+        for rid, content, source, author, author_type in rows
+    ]
+    conn.executemany(
+        "INSERT INTO working_memory (id, content, source, timestamp, session_id, author_id, author_type) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        data,
+    )
+    conn.commit()
+    conn.close()
+
+
+class TestRememberPerWriteAuthor:
+    def test_remember_kwarg_stamps_row_without_setting_beam_identity(self, temp_db):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        assert beam.author_id is None  # read identity untouchable by the fix
+
+        mid = beam.remember("stamped content", author_id="alice", author_type="human")
+
+        assert _wm_author(temp_db, mid) == ("alice", "human")
+        # The write must NOT have mutated the beam-level identity:
+        # prefetch scoping depends on it staying unset.
+        assert beam.author_id is None
+        assert beam.author_type is None
+
+    def test_remember_beam_identity_fallback_when_kwarg_absent(self, temp_db):
+        beam = BeamMemory(
+            session_id="s1", db_path=temp_db,
+            author_id="carol", author_type="agent",
+        )
+        mid = beam.remember("beam-identity content")
+        assert _wm_author(temp_db, mid) == ("carol", "agent")
+
+    def test_remember_kwarg_overrides_beam_identity(self, temp_db):
+        beam = BeamMemory(
+            session_id="s1", db_path=temp_db,
+            author_id="carol", author_type="agent",
+        )
+        mid = beam.remember("override content", author_id="dave", author_type="human")
+        assert _wm_author(temp_db, mid) == ("dave", "human")
+
+    def test_remember_kwarg_author_type_only_falls_through(self, temp_db):
+        beam = BeamMemory(
+            session_id="s1", db_path=temp_db,
+            author_id="carol", author_type="agent",
+        )
+        mid = beam.remember("type-only override", author_type="human")
+        assert _wm_author(temp_db, mid) == ("carol", "human")
+
+    def test_remember_kwarg_survives_dedup_update(self, temp_db):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        mid = beam.remember("dupe content", author_id="alice", author_type="human")
+        # Second write with a DIFFERENT author hits the dedup-update path.
+        mid2 = beam.remember("dupe content", author_id="bob", author_type="agent")
+        assert mid == mid2
+        assert _wm_author(temp_db, mid) == ("bob", "agent")
+
+
+class TestConsolidateToEpisodicAuthor:
+    def test_consolidation_stamps_explicit_author(self, temp_db):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        eid = beam.consolidate_to_episodic(
+            "summary", ["wm1"], author_id="alice", author_type="human"
+        )
+        row = tuple(beam.conn.execute(
+            "SELECT author_id, author_type FROM episodic_memory WHERE id = ?", (eid,)
+        ).fetchone())
+        assert row == ("alice", "human")
+
+    def test_consolidation_falls_back_to_beam_identity(self, temp_db):
+        beam = BeamMemory(
+            session_id="s1", db_path=temp_db,
+            author_id="carol", author_type="agent",
+        )
+        eid = beam.consolidate_to_episodic("summary", ["wm1"])
+        row = tuple(beam.conn.execute(
+            "SELECT author_id, author_type FROM episodic_memory WHERE id = ?", (eid,)
+        ).fetchone())
+        assert row == ("carol", "agent")
+
+    def test_consolidation_kwarg_overrides_beam_identity(self, temp_db):
+        beam = BeamMemory(
+            session_id="s1", db_path=temp_db,
+            author_id="carol", author_type="agent",
+        )
+        eid = beam.consolidate_to_episodic(
+            "summary", ["wm1"], author_id="dave", author_type="human"
+        )
+        row = tuple(beam.conn.execute(
+            "SELECT author_id, author_type FROM episodic_memory WHERE id = ?", (eid,)
+        ).fetchone())
+        assert row == ("dave", "human")
+
+
+class TestSleepAuthorPreservation:
+    def test_sleep_preserves_unanimous_source_author(self, temp_db):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        _seed_old_wm(beam, [
+            ("a1", "alpha fact", "conversation", "alice", "human"),
+            ("a2", "beta fact", "conversation", "alice", "human"),
+        ])
+
+        result = beam.sleep()
+
+        assert result["status"] == "consolidated"
+        row = tuple(beam.conn.execute(
+            "SELECT author_id, author_type FROM episodic_memory ORDER BY rowid DESC LIMIT 1"
+        ).fetchone())
+        assert row == ("alice", "human")
+        # Beam read identity untouched: prefetch stays session-scoped.
+        assert beam.author_id is None
+
+    def test_sleep_mixed_authors_fall_back_to_beam_identity(self, temp_db):
+        beam = BeamMemory(
+            session_id="s1", db_path=temp_db,
+            author_id="carol", author_type="agent",
+        )
+        _seed_old_wm(beam, [
+            ("a1", "alpha fact", "conversation", "alice", "human"),
+            ("a2", "beta fact", "conversation", "bob", "agent"),
+        ])
+
+        beam.sleep()
+
+        assert _ep_author(temp_db) == ("carol", "agent")
+
+    def test_sleep_absent_authors_fall_back_to_beam_identity(self, temp_db):
+        beam = BeamMemory(
+            session_id="s1", db_path=temp_db,
+            author_id="carol", author_type="agent",
+        )
+        _seed_old_wm(beam, [
+            ("a1", "alpha fact", "conversation", None, None),
+            ("a2", "beta fact", "conversation", None, None),
+        ])
+
+        beam.sleep()
+
+        assert _ep_author(temp_db) == ("carol", "agent")
+
+    def test_sleep_mixed_author_type_falls_back_author_id_only(self, temp_db):
+        """author_id unanimous but author_type mixed: id is preserved,
+        type falls back to beam identity independently."""
+        beam = BeamMemory(
+            session_id="s1", db_path=temp_db,
+            author_id="maintenance", author_type="bot",
+        )
+        _seed_old_wm(beam, [
+            ("a1", "alpha fact", "conversation", "alice", "human"),
+            ("a2", "beta fact", "conversation", "alice", "agent"),
+        ])
+
+        beam.sleep()
+
+        assert _ep_author(temp_db) == ("alice", "bot")

@@ -46,6 +46,24 @@ def _write_approval_enabled() -> bool:
         return False
 
 
+def _write_author(args: Optional[dict] = None) -> tuple[Optional[str], Optional[str]]:
+    """Resolve the per-write author stamp for Hermes provider write paths.
+
+    Resolution order mirrors ``mnemosyne.mcp_tools._create_instance``:
+    explicit tool arg > ``MNEMOSYNE_AUTHOR_ID`` / ``MNEMOSYNE_AUTHOR_TYPE``
+    env vars > None. The provider never sets ``beam.author_id`` from this:
+    recall/prefetch stays session-scoped (setting it would trigger the
+    ``(1=1)`` session/channel bypass in ``beam.recall``). The stamp is
+    instead passed per-write via ``remember(..., author_id=...)`` so rows
+    carry the author while the beam read identity stays unset.
+    """
+    args = args or {}
+    return (
+        args.get("author_id") or os.environ.get("MNEMOSYNE_AUTHOR_ID"),
+        args.get("author_type") or os.environ.get("MNEMOSYNE_AUTHOR_TYPE"),
+    )
+
+
 def _stage_pending_write(payload: Dict[str, Any]) -> str:
     from hermes_constants import get_hermes_home
     pid = uuid.uuid4().hex[:8]
@@ -1430,6 +1448,14 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._session_id = f"hermes_{stable_scope}"
 
         try:
+            # #914: identity is NOT passed to BeamMemory/Mnemosyne here.
+            # A non-empty beam.author_id would make recall() skip the
+            # session/channel scoping (the (1=1) bypass) and silently widen
+            # prefetch scope across gateway threads. The Hermes provider
+            # surfaces resolve the author per-write (env MNEMOSYNE_AUTHOR_ID
+            # / _TYPE, tool args) and pass it via remember(..., author_id=...)
+            # so rows carry the stamp while the beam read identity stays
+            # unset — mirroring mcp_tools._create_instance's interface.
             if self._profile_isolation_enabled:
                 # Route through Mnemosyne(bank=...) so BankManager handles
                 # directory creation, canonical path resolution, and isolates
@@ -1829,6 +1855,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     user_limit = _sync_turn_user_limit()
                     uc = user_content[:user_limit] if user_limit > 0 else user_content
                     stored_user = f"[USER] {uc}"
+                    author_id, author_type = _write_author()
                     capture = ledger.capture if ledger else None
                     remember = (lambda **kw: capture(ledger_session_id, ticket, beam, user_content, **kw)) if capture else beam.remember
                     remember(
@@ -1837,6 +1864,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         importance=0.5,
                         scope=self._default_scope,
                         extract_entities=True,
+                        author_id=author_id,
+                        author_type=author_type,
                     )
                     # Check for identity-significant signals in user content
                     self._capture_identity_signals(user_content)
@@ -1844,6 +1873,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     assistant_limit = _sync_turn_assistant_limit()
                     ac = assistant_content[:assistant_limit] if assistant_limit > 0 else assistant_content
                     stored_assistant = f"[ASSISTANT] {ac}"
+                    author_id, author_type = _write_author()
                     capture = ledger.capture if ledger else None
                     remember = (lambda **kw: capture(ledger_session_id, ticket, beam, assistant_content, **kw)) if capture else beam.remember
                     remember(
@@ -1852,6 +1882,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         importance=0.15,
                         scope=self._default_scope,
                         extract_entities=True,
+                        author_id=author_id,
+                        author_type=author_type,
                     )
                 if durable_operation:
                     self._turn_count += 1
@@ -1917,12 +1949,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         for signal in self._IDENTITY_SIGNALS:
             if signal in content_lower:
                 # Save identity memory with high importance for durable recall
+                author_id, author_type = _write_author()
                 self._beam.remember(
                     content=f"[IDENTITY] {user_content[:400]}",
                     source="identity",
                     importance=0.85,
                     scope="global",
                     veracity="stated",
+                    author_id=author_id,
+                    author_type=author_type,
                 )
                 break  # One identity memory per turn
 
@@ -2179,6 +2214,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         veracity = clamp_veracity(
             args.get("veracity"), context="mnemosyne_remember"
         )
+        author_id, author_type = _write_author(args)
         if not content:
             return json.dumps({"error": "content is required"})
 
@@ -2192,6 +2228,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 "extract_entities": extract_entities,
                 "extract": extract, "metadata": metadata,
                 "veracity": veracity,
+                "author_id": author_id, "author_type": author_type,
             })
             return json.dumps({
                 "status": "staged", "pending_id": pid,
@@ -2209,6 +2246,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             extract=extract,
             metadata=metadata,
             veracity=veracity,
+            author_id=author_id,
+            author_type=author_type,
         )
         self._audit_event(
             "remember", memory_id=memory_id, bank="private",
@@ -2233,6 +2272,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if bool(args.get("dry_run", False)):
             return json.dumps(dry_run_batch(normalized))
 
+        # #914: resolve the batch-level author once (tool args > env);
+        # per-operation payload author_id/author_type still wins per op
+        # inside apply_beam_batch.
+        batch_author_id, batch_author_type = _write_author(args)
+
         # Write-approval gate: stage each operation to pending when enabled.
         if _write_approval_enabled():
             staged = []
@@ -2248,6 +2292,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     "metadata": op.get("metadata"),
                     "veracity": op.get("veracity"),
                     "memory_id": op.get("memory_id"),
+                    "author_id": op.get("author_id") or batch_author_id,
+                    "author_type": op.get("author_type") or batch_author_type,
                 })
                 staged.append({"action": op.get("action"), "pending_id": pid})
             return json.dumps({
@@ -2264,6 +2310,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             remember_source_tool="mnemosyne_batch",
             audit_event=self._audit_event,
             extract_defaults_global=False,
+            default_author_id=batch_author_id,
+            default_author_type=batch_author_type,
         ))
 
     def _handle_recall(self, args: Dict[str, Any]) -> str:
@@ -2384,6 +2432,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         shared_path = self._shared_surface_path or (Path.home() / ".mnemosyne" / "data" / "shared" / "mnemosyne.db")
         shared_path.parent.mkdir(parents=True, exist_ok=True)
         self._shared_surface_path = shared_path
+        # #914: surface rows are stamped per-write via remember(..., author_id=...)
+        # in _handle_shared_remember; the beam itself stays author-less so
+        # shared-surface recall remains unscoped.
         self._surface_beam = BeamMemory(session_id="hermes_shared_surface", db_path=shared_path)
         logger.info("Mnemosyne shared surface initialized: db=%s", shared_path)
 
@@ -2419,6 +2470,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         meta = dict(metadata)
         meta.update({"shared_memory": True, "surface_kind": kind, "write_path": "manual_tool", "source_profile_session": self._session_id})
         existing_id = self._surface_beam._find_duplicate(surface_content)
+        author_id, author_type = _write_author(args)
         memory_id = self._surface_beam.remember(
             content=surface_content,
             source="surface_manual",
@@ -2427,6 +2479,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             scope="global",
             memory_id=stable_id,
             veracity=veracity,
+            author_id=author_id,
+            author_type=author_type,
         )
         self._audit_event(
             "shared_remember", memory_id=memory_id, bank="surface",
@@ -2838,6 +2892,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     extract=bool(p.get("extract", False)),
                     metadata=p.get("metadata"),
                     veracity=clamp_veracity(p.get("veracity"), context="apply_pending"),
+                    # #914: replay the stamp captured at stage time
+                    # (payload author > env at replay time), never NULL.
+                    author_id=p.get("author_id") or os.environ.get("MNEMOSYNE_AUTHOR_ID"),
+                    author_type=p.get("author_type") or os.environ.get("MNEMOSYNE_AUTHOR_TYPE"),
                 )
                 rp.unlink(missing_ok=True)
                 applied.append({"id": pid, "memory_id": mid})
@@ -3360,11 +3418,14 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 if beam is None:
                     return
                 scope = "global" if target == "user" else "session"
+                author_id, author_type = _write_author()
                 beam.remember(
                     content=content,
                     source=f"builtin_memory_{target}",
                     importance=0.7 if target == "user" else 0.5,
                     scope=scope,
+                    author_id=author_id,
+                    author_type=author_type,
                 )
         except Exception as e:
             logger.debug("Mnemosyne mirror write failed: %s", e)

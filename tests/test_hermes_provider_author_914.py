@@ -194,6 +194,28 @@ def test_shared_remember_env_author_stamps_surface_row(provider_module_name, mon
         provider._surface_beam.conn.close()
 
 
+@pytest.mark.parametrize("provider_module_name", [
+    "hermes_memory_provider",
+    "mnemosyne_hermes",
+])
+def test_shared_remember_tool_arg_author_wins_over_env(provider_module_name, monkeypatch):
+    module = _import_provider(provider_module_name)
+    monkeypatch.setenv("MNEMOSYNE_AUTHOR_ID", HERMES_AUTHOR_ID)
+    with _make_provider(module) as (provider, db_path):
+        shared_path = Path(db_path).parent / "shared" / "mnemosyne.db"
+        provider._shared_surface_path = shared_path
+        provider._ensure_surface_beam()
+        payload = json.loads(provider._handle_shared_remember({
+            "content": "shared explicit author write",
+            "kind": "preference",
+            "author_id": "per-call-author",
+            "author_type": "agent",
+        }))
+        mid = payload["memory_id"]
+        assert _wm_row(shared_path, mid) == ("per-call-author", "agent")
+        provider._surface_beam.conn.close()
+
+
 def _import_provider(package: str):
     """Import a provider package from its own source root, mirroring the
     module-swap pattern in test_hermes_provider_parity.py.

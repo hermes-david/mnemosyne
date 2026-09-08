@@ -194,6 +194,53 @@ def test_shared_remember_env_author_stamps_surface_row(provider_module_name, mon
         provider._surface_beam.conn.close()
 
 
+# ---------------------------------------------------------------------------
+# CWE-200: automatic prefetch must never inject author identity into recall()
+# ---------------------------------------------------------------------------
+
+
+class _RecordingBeam:
+    """Records recall() kwargs; simulates a beam that carries an author
+    identity (the read-side identity prefetch must ignore)."""
+
+    author_id = "beam-author"
+    author_type = "agent"
+
+    def __init__(self) -> None:
+        self.last_kwargs = None
+
+    def recall(self, **kwargs):
+        self.last_kwargs = kwargs
+        return []
+
+
+@pytest.mark.parametrize("provider_module_name", [
+    "hermes_memory_provider",
+    "mnemosyne_hermes",
+])
+def test_prefetch_never_passes_author_to_recall(provider_module_name, monkeypatch):
+    """CWE-200 regression: automatic prefetch must NOT forward author_id to
+    recall(), even when MNEMOSYNE_AUTHOR_ID is set in the environment or the
+    beam itself carries an author identity. A non-empty author_id makes
+    beam.recall() replace session/channel filtering with (1=1), leaking
+    memories across sessions. Author identity is a per-write stamp only."""
+    module = _import_provider(provider_module_name)
+    monkeypatch.setenv("MNEMOSYNE_AUTHOR_ID", HERMES_AUTHOR_ID)
+    monkeypatch.setenv("MNEMOSYNE_AUTHOR_TYPE", HERMES_AUTHOR_TYPE)
+
+    provider = module.MnemosyneMemoryProvider()
+    provider._beam = _RecordingBeam()
+    provider._agent_context = "primary"
+    provider._skip_contexts = set()
+
+    block = provider.prefetch("query for active session", session_id="session")
+
+    assert block == ""
+    assert provider._beam.last_kwargs is not None, "prefetch must reach recall()"
+    assert "author_id" not in provider._beam.last_kwargs
+    assert "author_type" not in provider._beam.last_kwargs
+
+
 def _import_provider(package: str):
     """Import a provider package from its own source root, mirroring the
     module-swap pattern in test_hermes_provider_parity.py.

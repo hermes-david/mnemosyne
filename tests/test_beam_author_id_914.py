@@ -198,6 +198,41 @@ class TestSleepAuthorPreservation:
 
         assert _ep_author(temp_db) == ("carol", "agent")
 
+    def test_sleep_missing_sibling_author_not_attributed_to_present_author(self, temp_db):
+        """Regression: a group where one row has an author and a sibling
+        row has none must NOT be treated as unanimous — the summary falls
+        back to the beam identity instead of being stamped with the
+        present row's author."""
+        beam = BeamMemory(
+            session_id="s1", db_path=temp_db,
+            author_id="carol", author_type="agent",
+        )
+        _seed_old_wm(beam, [
+            ("a1", "alpha fact", "conversation", "alice", "human"),
+            ("a2", "beta fact", "conversation", None, None),
+        ])
+
+        beam.sleep()
+
+        assert _ep_author(temp_db) == ("carol", "agent")
+
+    def test_sleep_missing_sibling_author_type_not_attributed_to_present_type(self, temp_db):
+        """author_id unanimous but a sibling row's author_type is absent:
+        the type must fall back to the beam identity, not the present
+        row's type."""
+        beam = BeamMemory(
+            session_id="s1", db_path=temp_db,
+            author_id="maintenance", author_type="bot",
+        )
+        _seed_old_wm(beam, [
+            ("a1", "alpha fact", "conversation", "alice", "human"),
+            ("a2", "beta fact", "conversation", "alice", None),
+        ])
+
+        beam.sleep()
+
+        assert _ep_author(temp_db) == ("alice", "bot")
+
     def test_sleep_mixed_author_type_falls_back_author_id_only(self, temp_db):
         """author_id unanimous but author_type mixed: id is preserved,
         type falls back to beam identity independently."""

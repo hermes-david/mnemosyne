@@ -117,6 +117,8 @@ SHARED_REMEMBER_SCHEMA = {
             "importance": {"type": "number", "description": "Importance 0.0-1.0. Default 0.8.", "default": 0.8},
             "veracity": {"type": "string", "description": "stated | inferred | tool | imported | unknown", "default": "unknown"},
             "metadata": {"type": "object", "description": "Optional metadata object.", "default": {}},
+            "author_id": {"type": "string", "description": "Per-write author stamp. Overrides MNEMOSYNE_AUTHOR_ID for this row; the beam's read identity is never modified."},
+            "author_type": {"type": "string", "description": "Per-write author type stamp. Overrides MNEMOSYNE_AUTHOR_TYPE for this row."},
         },
         "required": ["content"],
     },

@@ -10289,21 +10289,22 @@ class BeamMemory:
                     return ""
                 return v.strip()
 
-            _authors = {
-                _wm_author_text(item, "author_id")
-                for item in items
-                if _wm_author_text(item, "author_id")
-            }
-            if len(_authors) == 1 and len(items) > 0:
+            _author_values = [
+                _wm_author_text(item, "author_id") for item in items
+            ]
+            _authors = {v for v in _author_values if v}
+            # Unanimous only when EVERY row carries the same non-empty
+            # author; a sibling row with an absent author must not be
+            # attributed to the present rows' author (falls back below).
+            if len(_authors) == 1 and all(_author_values):
                 aggregated_author_id = _authors.pop() or None
             else:
                 aggregated_author_id = None
-            _author_types = {
-                _wm_author_text(item, "author_type")
-                for item in items
-                if _wm_author_text(item, "author_type")
-            }
-            if len(_author_types) == 1 and len(items) > 0:
+            _author_type_values = [
+                _wm_author_text(item, "author_type") for item in items
+            ]
+            _author_types = {v for v in _author_type_values if v}
+            if len(_author_types) == 1 and all(_author_type_values):
                 aggregated_author_type = _author_types.pop() or None
             else:
                 aggregated_author_type = None

@@ -2103,6 +2103,46 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
         return "default"
 
+    def _resolve_author_identity(self) -> dict:
+        """Resolve author identity for memory writes (issue #914).
+
+        Precedence (matches the MCP path in mnemosyne.mcp_tools._create_instance):
+        1. agent_identity kwarg (explicit, from Hermes)
+        2. MNEMOSYNE_AUTHOR_ID / MNEMOSYNE_AUTHOR_TYPE env vars
+        3. No identity -> empty dict (constructors called without author
+           kwargs, preserving the legacy NULL-author behavior exactly).
+
+        'primary' is a generic identity, not a specific author, and is
+        excluded the same way _resolve_profile_bank treats it.
+        """
+        identity = getattr(self, "_agent_identity", None) or ""
+        if identity and identity.lower() not in ("primary", "default", "none", ""):
+            result = {"author_id": identity}
+            author_type = os.environ.get("MNEMOSYNE_AUTHOR_TYPE")
+            if author_type:
+                result["author_type"] = author_type
+            return result
+
+        env_author = os.environ.get("MNEMOSYNE_AUTHOR_ID")
+        if env_author:
+            result = {"author_id": env_author}
+            author_type = os.environ.get("MNEMOSYNE_AUTHOR_TYPE")
+            if author_type:
+                result["author_type"] = author_type
+            return result
+
+        return {}
+
+    def _write_identity_kwargs(self) -> dict:
+        """Per-write author identity kwargs for remember() calls (issue #914).
+
+        Narrow per-write identity path per the #914 design note: identity is
+        attached at the WRITE, never by mutating the Beam's read identity
+        (self.author_id), because recall author-scoping keys off that field
+        and setting it would bypass session/channel scoping in prefetch.
+        """
+        return self._resolve_author_identity()
+
     def initialize(self, session_id: str, **kwargs) -> None:
         """Initialize Mnemosyne beam for this session."""
         with self._ensure_beam_access_lock():
@@ -2841,6 +2881,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     veracity="stated",
                     _write_kind=_SYSTEM_DERIVED_WRITE_CAPABILITY,
                     _write_policy=self._current_operation_write_policy(),
+                    **self._write_identity_kwargs(),
                 )
                 break  # One identity memory per turn
 
@@ -3139,6 +3180,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             metadata=metadata,
             veracity=veracity,
             _write_policy=self._current_operation_write_policy(),
+            **self._write_identity_kwargs(),
         )
         if memory_id is None:
             return json.dumps({"status": "filtered"})
@@ -3949,17 +3991,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     continue
                 payload = record.get("payload", {})
 
-                # Session binding (#936 review): a staged record belongs to the
-                # session it was staged from. Replay runs in whatever session is
-                # active when the approval arrives, so writing through the active
-                # beam would land the record in the wrong session after a switch.
-                #
-                # Replay is therefore bound to the RECORDED session, which is what
-                # makes an approval arriving from another session write to the
-                # right place rather than fail. A differing arrival session is
-                # reported in the result (not silently absorbed) so the caller can
-                # see the switch; legacy records staged before `session_scope`
-                # existed fall back to the active beam.
                 recorded_scope = str(record.get("session_scope") or "").strip()
                 recorded_channel = str(record.get("channel_scope") or "").strip()
                 current_scope = str(getattr(self, "_session_id", "") or "").strip()
@@ -4618,6 +4649,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     importance=0.7 if target == "user" else 0.5,
                     scope=scope,
                     _write_policy=self._current_operation_write_policy(),
+                    **self._write_identity_kwargs(),
                 )
         except Exception as e:
             logger.debug("Mnemosyne mirror write failed: %s", type(e).__name__)

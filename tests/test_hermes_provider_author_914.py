@@ -178,6 +178,75 @@ def test_remember_batch_per_operation_author_wins(provider_module_name, monkeypa
     "hermes_memory_provider",
     "mnemosyne_hermes",
 ])
+def test_batch_staging_preserves_per_operation_authors(provider_module_name, monkeypatch):
+    """#914 regression: per-op author stamps survive approval staging.
+
+    validate_batch_operations() normalizes each op to {index, action,
+    payload}; the staging loop must read author fields from op["payload"],
+    not the top-level op, or every op silently falls back to the
+    batch/env default.
+    """
+    module = _import_provider(provider_module_name)
+    monkeypatch.setenv("MNEMOSYNE_AUTHOR_ID", HERMES_AUTHOR_ID)
+    monkeypatch.setenv("MNEMOSYNE_AUTHOR_TYPE", HERMES_AUTHOR_TYPE)
+    monkeypatch.setattr(module, "_write_approval_enabled", lambda: True)
+    staged_payloads = []
+    monkeypatch.setattr(
+        module,
+        "_stage_pending_write",
+        lambda payload: staged_payloads.append(payload) or f"pid-{len(staged_payloads)}",
+    )
+    with _make_provider(module) as (provider, _db_path):
+        payload = json.loads(provider._handle_batch({
+            "operations": [
+                {"action": "remember", "content": "batch write one",
+                 "author_id": "op-author-a", "author_type": "agent"},
+                {"action": "remember", "content": "batch write two",
+                 "author_id": "op-author-b", "author_type": "profile"},
+            ],
+        }))
+    assert payload["status"] == "staged"
+    assert len(staged_payloads) == 2
+    assert staged_payloads[0]["author_id"] == "op-author-a"
+    assert staged_payloads[0]["author_type"] == "agent"
+    assert staged_payloads[1]["author_id"] == "op-author-b"
+    assert staged_payloads[1]["author_type"] == "profile"
+    # Content must survive staging too (same payload-normalization bug).
+    assert staged_payloads[0]["content"] == "batch write one"
+    assert staged_payloads[1]["content"] == "batch write two"
+
+
+@pytest.mark.parametrize("provider_module_name", [
+    "hermes_memory_provider",
+    "mnemosyne_hermes",
+])
+def test_batch_staging_falls_back_to_batch_default_author(provider_module_name, monkeypatch):
+    """Ops without their own author fall back to the batch/env default."""
+    module = _import_provider(provider_module_name)
+    monkeypatch.setenv("MNEMOSYNE_AUTHOR_ID", HERMES_AUTHOR_ID)
+    monkeypatch.setenv("MNEMOSYNE_AUTHOR_TYPE", HERMES_AUTHOR_TYPE)
+    monkeypatch.setattr(module, "_write_approval_enabled", lambda: True)
+    staged_payloads = []
+    monkeypatch.setattr(
+        module,
+        "_stage_pending_write",
+        lambda payload: staged_payloads.append(payload) or "pid-0",
+    )
+    with _make_provider(module) as (provider, _db_path):
+        payload = json.loads(provider._handle_batch({
+            "operations": [
+                {"action": "remember", "content": "batch write one"},
+            ],
+        }))
+    assert payload["status"] == "staged"
+    assert staged_payloads[0]["author_id"] == HERMES_AUTHOR_ID
+    assert staged_payloads[0]["author_type"] == HERMES_AUTHOR_TYPE
+
+
+@pytest.mark.parametrize("provider_module_name", [
+    "hermes_memory_provider",
+    "mnemosyne_hermes",
+])
 def test_shared_remember_env_author_stamps_surface_row(provider_module_name, monkeypatch):
     module = _import_provider(provider_module_name)
     monkeypatch.setenv("MNEMOSYNE_AUTHOR_ID", HERMES_AUTHOR_ID)
@@ -192,6 +261,53 @@ def test_shared_remember_env_author_stamps_surface_row(provider_module_name, mon
         mid = payload["memory_id"]
         assert _wm_row(shared_path, mid) == (HERMES_AUTHOR_ID, None)
         provider._surface_beam.conn.close()
+
+
+# ---------------------------------------------------------------------------
+# CWE-200: automatic prefetch must never inject author identity into recall()
+# ---------------------------------------------------------------------------
+
+
+class _RecordingBeam:
+    """Records recall() kwargs; simulates a beam that carries an author
+    identity (the read-side identity prefetch must ignore)."""
+
+    author_id = "beam-author"
+    author_type = "agent"
+
+    def __init__(self) -> None:
+        self.last_kwargs = None
+
+    def recall(self, **kwargs):
+        self.last_kwargs = kwargs
+        return []
+
+
+@pytest.mark.parametrize("provider_module_name", [
+    "hermes_memory_provider",
+    "mnemosyne_hermes",
+])
+def test_prefetch_never_passes_author_to_recall(provider_module_name, monkeypatch):
+    """CWE-200 regression: automatic prefetch must NOT forward author_id to
+    recall(), even when MNEMOSYNE_AUTHOR_ID is set in the environment or the
+    beam itself carries an author identity. A non-empty author_id makes
+    beam.recall() replace session/channel filtering with (1=1), leaking
+    memories across sessions. Author identity is a per-write stamp only."""
+    module = _import_provider(provider_module_name)
+    monkeypatch.setenv("MNEMOSYNE_AUTHOR_ID", HERMES_AUTHOR_ID)
+    monkeypatch.setenv("MNEMOSYNE_AUTHOR_TYPE", HERMES_AUTHOR_TYPE)
+
+    provider = module.MnemosyneMemoryProvider()
+    provider._beam = _RecordingBeam()
+    provider._agent_context = "primary"
+    provider._skip_contexts = set()
+
+    block = provider.prefetch("query for active session", session_id="session")
+
+    assert block == ""
+    assert provider._beam.last_kwargs is not None, "prefetch must reach recall()"
+    assert "author_id" not in provider._beam.last_kwargs
+    assert "author_type" not in provider._beam.last_kwargs
 
 
 @pytest.mark.parametrize("provider_module_name", [

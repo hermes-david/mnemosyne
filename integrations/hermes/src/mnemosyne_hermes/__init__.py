@@ -1598,36 +1598,33 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Recall relevant context via Mnemosyne hybrid search with temporal weighting.
-        
+
         Only includes memories above a relevance threshold to prevent context pollution
-        from low-quality matches. Scoped to the user's author_id when available."""
+        from low-quality matches. Strictly session-scoped: author identity is never
+        injected into this recall path (see CWE-200 note below)."""
         self._maybe_retry_init()
         if not self._beam or self._agent_context in self._skip_contexts:
             return ""
         try:
-            import os
             with self._beam_session_scope(session_id) as beam:
                 if beam is None:
                     return ""
-                author_id = beam.author_id or os.environ.get("MNEMOSYNE_AUTHOR_ID")
                 recall_kwargs: Dict[str, Any] = dict(
                     query=query,
                     top_k=max(_PREFETCH_TOP_K * 2, 16),
                     temporal_weight=0.2,
                     temporal_halflife=48,
                 )
-                # Only pass author_id when explicitly non-empty.  Passing an empty
-                # falsy author_id is harmless (no (1=1) bypass), but passing a real
-                # non-empty one triggers the (1=1) clause in beam.recall() that
-                # SKIPS session/channel filtering entirely -- which would defeat
-                # the gateway_session_key thread isolation above.  Multi-agent
-                # deployments that NEED author_id filtering can set it and accept
-                # the wider scope; the common case (single-user, per-thread
-                # sessions) should never bypass session scoping.
-                if author_id:
-                    recall_kwargs["author_id"] = author_id
-                # Revocable provider-owned capture proofs; explicit tools do not
-                # pass this optimization to recall.
+                # CWE-200 (#914 follow-up): author identity is NEVER injected
+                # into the automatic prefetch recall path. A non-empty
+                # author_id makes beam.recall() replace session/channel
+                # filtering with (1=1), silently widening prefetch scope
+                # across gateway threads and leaking memories across
+                # sessions. Author identity is applied exclusively as a
+                # per-write stamp (see _write_author); the beam read
+                # identity stays unset so recall keeps session scoping.
+                # Revocable provider-owned capture proofs; explicit tools do
+                # not pass this optimization to recall.
                 _ledger_key = str(session_id or "").strip() or getattr(
                     self, "_active_session_id", ""
                 ) or ""
@@ -2278,22 +2275,27 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         batch_author_id, batch_author_type = _write_author(args)
 
         # Write-approval gate: stage each operation to pending when enabled.
+        # validate_batch_operations() normalizes each op to
+        # {index, action, payload}, so per-op fields (including the #914
+        # author stamp) live under op["payload"]; batch/env defaults apply
+        # only when the individual op has no author of its own.
         if _write_approval_enabled():
             staged = []
             for op in normalized:
+                payload = op["payload"]
                 pid = _stage_pending_write({
                     "tool": "mnemosyne_batch",
                     "action": op.get("action"),
-                    "content": op.get("content", ""),
-                    "importance": op.get("importance", 0.5),
-                    "source": op.get("source", "user"),
-                    "scope": op.get("scope", self._default_scope),
-                    "valid_until": op.get("valid_until"),
-                    "metadata": op.get("metadata"),
-                    "veracity": op.get("veracity"),
-                    "memory_id": op.get("memory_id"),
-                    "author_id": op.get("author_id") or batch_author_id,
-                    "author_type": op.get("author_type") or batch_author_type,
+                    "content": payload.get("content", ""),
+                    "importance": payload.get("importance", 0.5),
+                    "source": payload.get("source", "user"),
+                    "scope": payload.get("scope", self._default_scope),
+                    "valid_until": payload.get("valid_until"),
+                    "metadata": payload.get("metadata"),
+                    "veracity": payload.get("veracity"),
+                    "memory_id": payload.get("memory_id"),
+                    "author_id": payload.get("author_id") or batch_author_id,
+                    "author_type": payload.get("author_type") or batch_author_type,
                 })
                 staged.append({"action": op.get("action"), "pending_id": pid})
             return json.dumps({

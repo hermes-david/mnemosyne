@@ -2269,11 +2269,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def _prefetch_bank(self, query: str, session_id: str, profile: "PrefetchProfile") -> str:
         """The built-in memory-bank source: hybrid recall with temporal weighting,
-        relevance + low-quality filtering, scoped to author_id when available.
+        relevance + low-quality filtering, strictly session-scoped.
         Parameterized by *profile*."""
         try:
-            import os
-            author_id = self._beam.author_id or os.environ.get("MNEMOSYNE_AUTHOR_ID")
             overfetch = max(profile.top_k * 2, _PREFETCH_OVERFETCH)  # over-fetch; junk filtered below
             recall_kwargs: Dict[str, Any] = dict(
                 query=query, top_k=overfetch,
@@ -2288,16 +2286,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 recall_kwargs["vec_weight"] = profile.vec_weight
             if profile.fts_weight is not None:
                 recall_kwargs["fts_weight"] = profile.fts_weight
-            # Only pass author_id when explicitly non-empty.  Passing an empty
-            # falsy author_id is harmless (no (1=1) bypass), but passing a real
-            # non-empty one triggers the (1=1) clause in beam.recall() that
-            # SKIPS session/channel filtering entirely -- which would defeat
-            # the gateway_session_key thread isolation above.  Multi-agent
-            # deployments that NEED author_id filtering can set it and accept
-            # the wider scope; the common case (single-user, per-thread
-            # sessions) should never bypass session scoping.
-            if author_id:
-                recall_kwargs["author_id"] = author_id
+            # CWE-200 (#914 follow-up): author identity is NEVER injected into
+            # the automatic prefetch recall path. A non-empty author_id makes
+            # beam.recall() replace session/channel filtering with (1=1),
+            # silently widening prefetch scope across gateway threads and
+            # leaking memories across sessions. Author identity is applied
+            # exclusively as a per-write stamp (see _write_author); the beam
+            # read identity stays unset so recall keeps session scoping.
             # Revocable provider-owned capture proofs; explicit tools do not
             # pass this optimization to recall.
             _ledger_key = str(session_id or "").strip() or getattr(
@@ -2841,17 +2836,18 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if _write_approval_enabled():
             staged = []
             for op in normalized:
+                payload = op["payload"]
                 pid = _stage_pending_write({
                     "tool": "mnemosyne_batch",
                     "action": op.get("action", ""),
-                    "content": op.get("content", ""),
-                    "importance": op.get("importance", 0.5),
-                    "source": op.get("source", "user"),
-                    "scope": op.get("scope", self._default_scope),
-                    "metadata": op.get("metadata"),
-                    "veracity": op.get("veracity"),
-                    "author_id": op.get("author_id") or batch_author_id,
-                    "author_type": op.get("author_type") or batch_author_type,
+                    "content": payload.get("content", ""),
+                    "importance": payload.get("importance", 0.5),
+                    "source": payload.get("source", "user"),
+                    "scope": payload.get("scope", self._default_scope),
+                    "metadata": payload.get("metadata"),
+                    "veracity": payload.get("veracity"),
+                    "author_id": payload.get("author_id") or batch_author_id,
+                    "author_type": payload.get("author_type") or batch_author_type,
                 })
                 staged.append(pid)
             return json.dumps({

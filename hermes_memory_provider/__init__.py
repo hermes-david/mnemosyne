@@ -34,6 +34,35 @@ import uuid
 # Write-approval gate: when memory.write_approval is enabled, writes are
 # staged to pending/memory/<id>.json instead of committed directly.
 # apply_pending() replays approved records through the BEAM write path.
+
+def _stamp_memory_author(beam, memory_id):
+    """Write-only author stamping for the Hermes provider path.
+
+    Tags the inserted working_memory row with the active agent's author_id
+    WITHOUT setting beam.author_id, so automatic prefetch recall stays
+    unscoped (setting beam.author_id would trigger the (1=1) session-bypass
+    in beam.recall for the prefetch path). Env interface mirrors
+    mnemosyne.mcp_tools identity resolution.
+    """
+    try:
+        author = os.environ.get("MNEMOSYNE_AUTHOR_ID")
+        if author and memory_id and beam is not None:
+            conn = getattr(beam, "conn", None)
+            if conn is not None:
+                conn.execute(
+                    "UPDATE working_memory SET author_id = ? WHERE id = ?",
+                    (author, memory_id),
+                )
+                # Beam connections defer commits; stamp must be durable
+                # before the response is returned.
+                try:
+                    conn.commit()
+                except AttributeError:
+                    pass
+    except Exception:
+        logger.debug("Mnemosyne: author stamp skipped (non-fatal)", exc_info=True)
+
+
 def _write_approval_enabled() -> bool:
     """Check if memory.write_approval is enabled in Hermes config."""
     try:
@@ -2826,6 +2855,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             metadata=metadata,
             veracity=veracity,
         )
+        _stamp_memory_author(self._beam, memory_id)
         self._audit_event(
             "remember", memory_id=memory_id, bank="private",
             scope=scope, source_tool="mnemosyne_remember",
@@ -2904,7 +2934,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 "message": f"{len(staged)} writes staged for approval. Use mnemosyne_apply_pending to commit.",
             })
 
-        return json.dumps(apply_beam_batch(
+        result = apply_beam_batch(
             self._beam,
             normalized,
             default_scope=self._default_scope,
@@ -2912,7 +2942,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             remember_source_tool="mnemosyne_batch",
             audit_event=self._audit_event,
             extract_defaults_global=False,
-        ))
+        )
+        if isinstance(result, dict) and result.get("status") == "ok":
+            for r in result.get("results", []):
+                if r.get("action") == "remember" and r.get("status") == "stored":
+                    _stamp_memory_author(self._beam, r.get("memory_id"))
+        return json.dumps(result)
 
     def _handle_recall(self, args: Dict[str, Any]) -> str:
         query = args.get("query", "")

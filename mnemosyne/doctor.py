@@ -475,9 +475,12 @@ _RUNTIME_CHECK_NAMES = frozenset(
         "embeddings_dim",
         "sqlite_vec_available",
         "sqlite_vec_warning",
+        "vec_index_integrity",
     }
 )
-_RUNTIME_STATUSES = frozenset({"OK", "YES", "NO", "MISSING", "OPTIONAL", "ERROR"})
+_RUNTIME_STATUSES = frozenset(
+    {"OK", "YES", "NO", "MISSING", "OPTIONAL", "ERROR", "CORRUPT"}
+)
 
 
 def _safe_runtime_detail(check: str, value: Any) -> str:
@@ -630,6 +633,29 @@ class HygieneSummaryAdapter:
         }
 
 
+def _vec_index_integrity_check(conn: sqlite3.Connection) -> dict[str, str] | None:
+    """Probe vec0 chunk-blob sizes on the caller's read-only connection.
+
+    Returns a runtime-check entry (category ``index``) for the doctor report,
+    or ``None`` when the probe cannot run at all. The check reads only
+    ``sqlite_master`` DDL and ``length(vectors)`` from vec0 shadow tables, so
+    it needs no extension loading and works on a ``query_only`` connection.
+    """
+
+    try:
+        from mnemosyne.runtime_diagnostics import vec_index_integrity
+
+        status, detail = vec_index_integrity(conn)
+    except Exception:
+        return None
+    return {
+        "category": "index",
+        "check": "vec_index_integrity",
+        "status": status,
+        "detail": detail,
+    }
+
+
 def build_doctor_report(
     bank_name: str,
     db_path: str | Path,
@@ -691,6 +717,30 @@ def build_doctor_report(
             scan_limit=scan_limit,
             candidate_limit=candidate_limit,
         ).inspect().metrics
+        # The runtime adapter ran before this connection existed, so its
+        # vec_index_integrity check had no store to inspect. Append the
+        # store-level probe here, through the same sanitization boundary.
+        integrity = _vec_index_integrity_check(conn)
+        if integrity is not None:
+            runtime = report.runtime_diagnostics
+            if isinstance(runtime, dict) and isinstance(runtime.get("checks"), list):
+                runtime["checks"].append(integrity)
+                if integrity["status"] in {"ERROR", "CORRUPT"}:
+                    runtime["status"] = "unavailable"
+                    report.findings.append(
+                        Finding(
+                            code="vec_index_integrity",
+                            status="corrupt",
+                            severity=SEVERITY_CRITICAL,
+                            message=(
+                                "A vector-index chunk blob does not match its "
+                                "declared size; dense recall fails and falls "
+                                "back to keyword recall. Rebuild the vector "
+                                "index with 'mnemosyne reindex --yes'."
+                            ),
+                            details={"operation": "schema_metadata"},
+                        )
+                    )
     finally:
         conn.close()
     return report

@@ -713,6 +713,117 @@ def _existing_vec_dim(conn: sqlite3.Connection) -> Optional[int]:
     return dimensions.pop() if len(dimensions) == 1 else None
 
 
+# Module-level state for the recall vec-failure latch + hint sets.
+# Plain module globals (mirroring the ``_vec_working_count_cache`` precedent):
+# no config knobs, no env vars, no new public API.
+_RECALL_VEC_LATCH: Dict[int, Tuple[int, str, sqlite3.Connection]] = {}
+# Bounded: failures are rare, and each entry pins its connection (see
+# _recall_vec_latch_set). If more distinct connections fail than this, the
+# oldest entries are dropped -- a dropped latch only means the next call
+# re-attempts the KNN and re-reports at ERROR, never a missed failure.
+_RECALL_VEC_LATCH_MAX = 32
+# One remediation hint per (connection, table) for vec_* write failures.
+# Keyed by id(conn) like the latch (sqlite3.Connection has no weakref
+# support); the entry pins the connection so a reused address cannot
+# suppress a new connection's first hint. Bounded like the latch -- a
+# dropped entry only means an extra hint line, never a missed failure.
+_VEC_WRITE_HINTED: Dict[Tuple[int, str], sqlite3.Connection] = {}
+_VEC_WRITE_HINTED_MAX = 64
+_REINDEX_HINT = (
+    "%s index writes are failing; the vector index is likely corrupt. "
+    "Run 'mnemosyne reindex --yes' (with providers stopped) to rebuild it."
+)
+
+
+def _notify_vec_write_failure(conn: sqlite3.Connection, table: str,
+                              rowid: Optional[int], exc: BaseException,
+                              *, context: str) -> None:
+    """Log a vec_* write failure at ERROR and emit a one-time reindex hint.
+
+    The memory row is the payload and the vector is an index: a vec write
+    failure must never abort the memory write, but it must be VISIBLE.
+    The incident's rowid 145/146 failures were bare WARNINGs while the
+    index was already corrupt, and two consolidations later recall died.
+
+    The remediation hint fires once per (connection, table) per process —
+    matching the Component 2 latch style, no new infrastructure.
+    """
+    logger.error(
+        "%s: %s insert failed (rowid=%s): %s: %s",
+        context, table, rowid, type(exc).__name__, exc,
+        exc_info=True,
+    )
+    hint_key = (id(conn), table)
+    hinted_conn = _VEC_WRITE_HINTED.get(hint_key)
+    if hinted_conn is not conn:
+        if len(_VEC_WRITE_HINTED) >= _VEC_WRITE_HINTED_MAX:
+            _VEC_WRITE_HINTED.pop(next(iter(_VEC_WRITE_HINTED)), None)
+        _VEC_WRITE_HINTED[hint_key] = conn
+        logger.error(_REINDEX_HINT, table)
+
+
+def _recall_vec_latch_set(conn: sqlite3.Connection, exc: BaseException) -> None:
+    """Latch a vec-search failure for this connection, keyed on data_version.
+
+    Avoids per-call error spam and repeated failing KNN queries: after the
+    first caught failure, later ``recall()`` calls skip the KNN until the
+    connection observes an external commit (``PRAGMA data_version`` change,
+    e.g. an out-of-process reindex) or ``reindex_vectors()`` clears it.
+
+    The entry holds a strong reference to the failed connection. That is
+    deliberate: ``sqlite3.Connection`` does not support weakref, so an
+    ``id(conn)``-keyed dict could otherwise hand a stale latch to a NEW
+    connection that merely reused the freed address -- silently skipping the
+    KNN with only a DEBUG log. Holding the reference makes the id stable for
+    as long as the entry lives, so the latch can only ever match the exact
+    connection it was set for. The cost is one pinned connection per failure
+    event (failures are rare, and the entry is dropped on the next
+    data_version change or in-process reindex).
+    """
+    snippet = f"{type(exc).__name__}: {exc}"
+    try:
+        data_version = int(conn.execute("PRAGMA data_version").fetchone()[0])
+    except sqlite3.Error:
+        # Never add a second failure mode to the failure path.
+        data_version = -1
+    if len(_RECALL_VEC_LATCH) >= _RECALL_VEC_LATCH_MAX and id(conn) not in _RECALL_VEC_LATCH:
+        # Drop one old entry before adding (dict preserves insertion order).
+        _RECALL_VEC_LATCH.pop(next(iter(_RECALL_VEC_LATCH)), None)
+    _RECALL_VEC_LATCH[id(conn)] = (data_version, snippet, conn)
+
+
+def _recall_vec_latch_active(conn: sqlite3.Connection) -> bool:
+    """Return whether a latched vec failure still applies to this connection.
+
+    A latch is stale once the connection's ``PRAGMA data_version`` changes
+    (another process committed, e.g. a repair/reindex), at which point the
+    entry is dropped and the next call re-attempts the KNN. A probe failure
+    (locked db) counts as unlatched -- never a second failure mode.
+    """
+    entry = _RECALL_VEC_LATCH.get(id(conn))
+    if entry is None:
+        return False
+    latched_version, _snippet, latched_conn = entry
+    if latched_conn is not conn:
+        # Defensive identity check -- see _recall_vec_latch_set for why the
+        # entry holds the connection itself.
+        _RECALL_VEC_LATCH.pop(id(conn), None)
+        return False
+    try:
+        current_version = int(conn.execute("PRAGMA data_version").fetchone()[0])
+    except sqlite3.Error:
+        return False
+    if current_version != latched_version:
+        _RECALL_VEC_LATCH.pop(id(conn), None)
+        return False
+    return True
+
+
+def _recall_vec_latch_clear(conn: sqlite3.Connection) -> None:
+    """Clear the latch for a connection after an in-process repair."""
+    _RECALL_VEC_LATCH.pop(id(conn), None)
+
+
 def _dim_mismatch_message(
     stored_dims: Tuple[Tuple[str, int], ...], configured_dim: int
 ) -> str:
@@ -3267,6 +3378,10 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
                 f"CREATE VIRTUAL TABLE {table} USING vec0(embedding {vec_type}[{target_dim}])"
             )
         _commit_reindex_writes()
+        # The rebuild repairs whatever the recall latch was set for; clear it
+        # so the next recall() in this process re-attempts the KNN instead of
+        # skipping on a stale failure entry.
+        _recall_vec_latch_clear(conn)
 
     # 2) Working memory -> memory_embeddings (+ vec_working), via the shared write
     #    helper so the float-JSON and sqlite-vec stores stay consistent.
@@ -5987,9 +6102,13 @@ class BeamMemory:
                         self.conn, rowid, np.asarray(vec[0]).tolist(), commit=False
                     )
                 except Exception as _vec_exc:
-                    logger.warning(
-                        "vec_episodes insert failed (rowid=%s): %s",
-                        rowid, _vec_exc,
+                    # The memory row is the payload; the vector is an index.
+                    # Never abort the write, but make the failure VISIBLE:
+                    # the incident's bare WARNINGs here were the only signal
+                    # while the index was already corrupt.
+                    _notify_vec_write_failure(
+                        self.conn, "vec_episodes", rowid, _vec_exc,
+                        context="consolidate_to_episodic",
                     )
             elif vec is not None:
                 # Fallback: store in memory_embeddings table for in-memory
@@ -6008,7 +6127,12 @@ class BeamMemory:
                         (bv, rowid)
                     )
                 except Exception:
-                    pass  # Non-blocking
+                    # Non-blocking by design, but never silent: a persistently
+                    # failing binary_vector write is an index-health signal.
+                    logger.debug(
+                        "binary_vector update failed for episodic rowid=%s",
+                        rowid, exc_info=True,
+                    )
 
         try:
             if _owned_txn:
@@ -7398,7 +7522,10 @@ class BeamMemory:
                         wm_vec_sims[vr["id"]] = vr["sim"]
                         wm_ids.add(vr["id"])  # Merge vector results with FTS5 results
             except Exception:
-                logger.info("Regex extraction failed, skipping", exc_info=True)
+                logger.warning(
+                    "Working-memory vector search failed; wm dense voice "
+                    "skipped for this call", exc_info=True,
+                )
         # Track whether the FTS+vec layer produced any candidates
         # at all (signal source for the truly_empty gate later).
         if wm_ids:
@@ -7726,16 +7853,54 @@ class BeamMemory:
                 query_bv = _mib(emb_result)
 
         # ---- Episodic memory (vec + FTS5 hybrid) ----
+        # A vec-index failure must never kill the query: the vector voice is
+        # one of three weighted signals (vec/fts/importance) in the hybrid
+        # scorer, and an empty `vec_results` is already a handled, pre-existing
+        # degraded state (the dim-mismatch path in _vec_search returns []).
+        # Containment lives HERE, not in _vec_search: that helper's strict
+        # classify-then-propagate contract is deliberate and unit-tested, and
+        # a real storage failure must stay loud at the layer that knows it is
+        # one. This single call site is the only consumer of both KNN branches,
+        # so one wrap covers every recall surface (recall_enhanced, Mnemosyne.
+        # recall, the CLI, and the Hermes provider tool).
         vec_results = {}
         max_distance = 0.0
         if embeddings_available:
             emb_result = _get_query_embedding()
             if emb_result is not None:
-                if _vec_available(self.conn):
-                    vec_rows = _vec_search(self.conn, emb_result.tolist(), k=max(top_k * 3, 20))
+                vec_rows = []
+                if _recall_vec_latch_active(self.conn):
+                    # A previous KNN in this process already failed against
+                    # this connection's data_version; skip the known-bad query
+                    # (DEBUG, not ERROR -- the first failure was reported).
+                    logger.debug(
+                        "Episodic vector search latched off after an earlier "
+                        "failure on this connection; skipping KNN for this call."
+                    )
                 else:
-                    # Fallback: in-memory cosine similarity search
-                    vec_rows = _in_memory_vec_search(self.conn, emb_result, k=max(top_k * 3, 20))
+                    try:
+                        if _vec_available(self.conn):
+                            vec_rows = _vec_search(self.conn, emb_result.tolist(), k=max(top_k * 3, 20))
+                        else:
+                            # Fallback: in-memory cosine similarity search
+                            vec_rows = _in_memory_vec_search(self.conn, emb_result, k=max(top_k * 3, 20))
+                    except sqlite3.Error as _vec_exc:
+                        # Scope the catch to sqlite3.Error ONLY (the corruption
+                        # mode -- "vectors blob size doesn't match" -- is an
+                        # OperationalError, a subclass). A TypeError/ValueError
+                        # from the embedding shape is a code bug and must still
+                        # surface loudly.
+                        logger.error(
+                            "Episodic vector search failed on vec_episodes "
+                            "(%s: %s); falling back to FTS keyword recall. "
+                            "The vector index is likely corrupt -- run "
+                            "'mnemosyne reindex --yes' (with providers stopped) "
+                            "to rebuild it.",
+                            type(_vec_exc).__name__, _vec_exc,
+                            exc_info=True,
+                        )
+                        _recall_vec_latch_set(self.conn, _vec_exc)
+                        vec_rows = []
                 if vec_rows:
                     max_distance = max(vr["distance"] for vr in vec_rows)
                     for vr in vec_rows:
@@ -9618,9 +9783,27 @@ class BeamMemory:
                 # DELETE+INSERT to refresh.
                 if vec_available_now:
                     cursor.execute("DELETE FROM vec_episodes WHERE rowid = ?", (rowid,))
-                    _vec_insert(
-                        self.conn, rowid, np.asarray(vec[0]).tolist(), commit=False
-                    )
+                    try:
+                        _vec_insert(
+                            self.conn, rowid, np.asarray(vec[0]).tolist(), commit=False
+                        )
+                    except sqlite3.Error as _vec_exc:
+                        # Content update persists (the row is the payload); the
+                        # vec row stays absent (the DELETE above already
+                        # removed the stale one, so no OLD-embedding drift can
+                        # survive) and the row degrades to FTS recall.
+                        #
+                        # Scoped to sqlite3.Error deliberately: a non-SQL
+                        # failure from this path is a code bug, and letting it
+                        # propagate preserves the caller's SAVEPOINT rollback
+                        # that keeps content/tier/vec atomic (test_degrade_
+                        # vector.py::test_sqlite_vec_refresh_failure_rolls_
+                        # back_row_and_vector). The corruption mode this guard
+                        # exists for is an OperationalError, a sqlite3.Error.
+                        _notify_vec_write_failure(
+                            self.conn, "vec_episodes", rowid, _vec_exc,
+                            context="_refresh_episodic_embedding",
+                        )
                 else:
                     cursor.execute("""
                         INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model)
@@ -9635,7 +9818,10 @@ class BeamMemory:
                             (bv, memory_id),
                         )
                     except Exception:
-                        logger.info("Regex extraction failed, skipping", exc_info=True)
+                        logger.debug(
+                            "binary_vector refresh failed for %s; binary "
+                            "voice stale for this row", memory_id, exc_info=True,
+                        )
                 return
 
         # Provider unavailable (or embed() returned None). Invalidate the
@@ -11165,8 +11351,15 @@ class BeamMemory:
                 try:
                     _vec_insert(self.conn, new_rowid, embedding)
                     stats["episodic_memory"]["embeddings_inserted"] += 1
-                except Exception:
-                    logger.info("Regex extraction failed, skipping", exc_info=True)
+                except Exception as _vec_exc:
+                    # Import failures matter: an import that silently drops
+                    # every vector leaves the store looking healthy while the
+                    # dense voice is hollow. Pre-fix this logged a false
+                    # "Regex extraction failed, skipping" at INFO.
+                    _notify_vec_write_failure(
+                        self.conn, "vec_episodes", new_rowid, _vec_exc,
+                        context="import_from_dict",
+                    )
         if vec_ok:
             self.conn.commit()
 

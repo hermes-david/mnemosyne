@@ -3602,6 +3602,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     source=f"builtin_memory_{target}",
                     importance=0.7 if target == "user" else 0.5,
                     scope=scope,
+                    **self._write_identity_kwargs(),
                 )
         except Exception as e:
             logger.debug("Mnemosyne mirror write failed: %s", e)

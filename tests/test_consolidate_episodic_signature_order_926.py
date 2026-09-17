@@ -57,3 +57,29 @@ def test_author_params_are_keyword_safe_by_position():
         "author_id moved earlier than the appended slot; positional callers "
         f"could mis-bind: index={params.index('author_id')}"
     )
+
+
+# The same hazard applies to every signature the #914 work touched. Both
+# remember() entry points must keep `dedupe` ahead of the author params:
+# BeamMemory.remember already appended them, Mnemosyne.remember originally
+# inserted them before `dedupe` (CodeRabbit comment 4040483068).
+def _assert_dedupe_precedes_author(func, label):
+    params = list(inspect.signature(func).parameters)
+    assert "dedupe" in params, f"{label}: dedupe parameter disappeared"
+    assert params.index("dedupe") < params.index("author_id"), (
+        f"{label}: author_id precedes dedupe, so a positional dedupe argument "
+        f"would bind to author_id instead: {params!r}"
+    )
+    assert params[-2:] == ["author_id", "author_type"], (
+        f"{label}: author params must trail the signature, got {params[-3:]!r}"
+    )
+
+
+def test_mnemosyne_remember_keeps_dedupe_positional():
+    from mnemosyne.core.memory import Mnemosyne
+
+    _assert_dedupe_precedes_author(Mnemosyne.remember, "Mnemosyne.remember")
+
+
+def test_beam_remember_keeps_dedupe_positional():
+    _assert_dedupe_precedes_author(BeamMemory.remember, "BeamMemory.remember")

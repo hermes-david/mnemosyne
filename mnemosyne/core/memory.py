@@ -541,9 +541,9 @@ class Mnemosyne:
                  veracity: str = "unknown",
                  trust_tier: str = None,
                  memory_type: str = None,
+                 dedupe: bool = True,
                  author_id: Optional[str] = None,
-                 author_type: Optional[str] = None,
-                 dedupe: bool = True) -> str:
+                 author_type: Optional[str] = None) -> str:
         """
         Store a memory directly to SQLite.
         Writes to both BEAM working_memory and legacy memories table.

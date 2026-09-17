@@ -324,3 +324,43 @@ def _import_provider(package: str):
                 sys.path.remove(path)
             except ValueError:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Mirror-write parity: on_memory_write (builtin memory tool) on both surfaces
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("provider_module_name", [
+    "hermes_memory_provider",
+    "mnemosyne_hermes",
+])
+def test_on_memory_write_mirror_stamps_author(provider_module_name, monkeypatch):
+    """The builtin-memory mirror write must carry the author on BOTH surfaces.
+
+    CodeRabbit review finding on PR #926 (comment 4040483068's sibling, review
+    5230504707): the sibling provider forwarded its write-identity kwargs in
+    ``on_memory_write`` while ``mnemosyne_hermes`` did not, so the same
+    ``builtin_memory_*`` write was stamped on one fork and NULL on the other.
+    """
+    module = _import_provider(provider_module_name)
+    monkeypatch.setenv("MNEMOSYNE_AUTHOR_ID", HERMES_AUTHOR_ID)
+    monkeypatch.setenv("MNEMOSYNE_AUTHOR_TYPE", HERMES_AUTHOR_TYPE)
+    with _make_provider(module) as (provider, db_path):
+        label = f"mirror write {provider_module_name}"
+        provider.on_memory_write("add", "user", label)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute(
+                "SELECT author_id, author_type FROM working_memory WHERE content = ?",
+                (label,),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None, "mirror write did not reach working_memory"
+        assert tuple(row) == (HERMES_AUTHOR_ID, HERMES_AUTHOR_TYPE), (
+            f"{provider_module_name}: mirror write lost its author stamp: {tuple(row)!r}"
+        )
+        # Read identity must stay unset so prefetch remains session-scoped.
+        assert provider._beam.author_id is None
+        assert provider._beam.author_type is None

@@ -7032,14 +7032,14 @@ class BeamMemory:
                                 metadata: Dict = None, valid_until: str = None,
                                 scope: str = "session",
                                 veracity: Optional[str] = None,
-                                author_id: Optional[str] = None,
-                                author_type: Optional[str] = None,
                                 event_timestamp: 'Optional[str]' = None,
                                 event_date: 'Optional[str]' = None,
                                 event_date_precision: 'Optional[str]' = None,
                                 emit_event: bool = True,
                                 _write_kind: object = "public",
-                                _write_policy=None) -> Optional[str]:
+                                _write_policy=None,
+                                author_id: Optional[str] = None,
+                                author_type: Optional[str] = None) -> Optional[str]:
         """
         Store a consolidated summary into episodic_memory with optional embedding.
 
@@ -7052,6 +7052,10 @@ class BeamMemory:
             event date. This method never derives event_date from
             event_timestamp — ingest time and event time are distinct
             contracts (see sleep()'s aggregation rule).
+
+        `author_id` / `author_type` are appended AFTER `emit_event` to keep the
+        positional slots of the pre-existing `event_*` / `emit_event` params
+        stable; every caller in-tree passes them by keyword.
 
         E4.a.1: `veracity` kwarg threads the aggregated source-row veracity
         into the episodic INSERT. Pre-fix the INSERT didn't include the

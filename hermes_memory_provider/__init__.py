@@ -3292,6 +3292,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             staged_actions = []
             results = []
             for op in normalized:
+                # #926 (CodeRabbit F1): validate_batch_operations() wraps each
+                # op as {"index", "action", "payload": dict(op)} — every field
+                # must be read from payload, not the top-level op, or the
+                # staged record carries content='' and _handle_apply_pending
+                # deletes it without writing (data loss). Pre-existing bug in
+                # this dict from the write_approval gate lineage, fixed here.
                 payload = op["payload"]
                 action = op.get("action", "")
                 if action == "remember":
@@ -3318,6 +3324,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         "veracity": payload.get("veracity"),
                         "memory_id": payload.get("memory_id"),
                         "replacement_id": payload.get("replacement_id"),
+                        "author_id": payload.get("author_id") or batch_author_id,
+                        "author_type": payload.get("author_type") or batch_author_type,
                     }, session_scope=str(getattr(self, "_session_id", "") or ""),
                        channel_scope=str(
                            getattr(getattr(self, "_beam", None), "channel_id", "") or ""

@@ -186,6 +186,12 @@ def test_batch_staging_preserves_per_operation_authors(provider_module_name, mon
     payload}; the staging loop must read author fields from op["payload"],
     not the top-level op, or every op silently falls back to the
     batch/env default.
+
+    #926 (CodeRabbit F1/F4): the same op-vs-payload lookup bug silently
+    emptied every other staged field (content '', importance 0.5 ...), and
+    _handle_apply_pending then deleted the record without writing memory.
+    Asserting only the author fields could not catch it, so every staged
+    field here is asserted against a NON-default value.
     """
     module = _import_provider(provider_module_name)
     monkeypatch.setenv("MNEMOSYNE_AUTHOR_ID", HERMES_AUTHOR_ID)
@@ -201,8 +207,14 @@ def test_batch_staging_preserves_per_operation_authors(provider_module_name, mon
         payload = json.loads(provider._handle_batch({
             "operations": [
                 {"action": "remember", "content": "batch write one",
+                 "importance": 0.91, "source": "op-source-a",
+                 "scope": "global", "metadata": {"op": "a"},
+                 "veracity": "stated", "valid_until": "2030-01-01",
                  "author_id": "op-author-a", "author_type": "agent"},
                 {"action": "remember", "content": "batch write two",
+                 "importance": 0.23, "source": "op-source-b",
+                 "scope": "session", "metadata": {"op": "b"},
+                 "veracity": "inferred", "valid_until": "2030-02-02",
                  "author_id": "op-author-b", "author_type": "profile"},
             ],
         }))
@@ -212,6 +224,21 @@ def test_batch_staging_preserves_per_operation_authors(provider_module_name, mon
     assert staged_payloads[0]["author_type"] == "agent"
     assert staged_payloads[1]["author_id"] == "op-author-b"
     assert staged_payloads[1]["author_type"] == "profile"
+    # F1: every op field must come from payload, not the top-level op.
+    assert staged_payloads[0]["content"] == "batch write one"
+    assert staged_payloads[0]["importance"] == 0.91
+    assert staged_payloads[0]["source"] == "op-source-a"
+    assert staged_payloads[0]["scope"] == "global"
+    assert staged_payloads[0]["metadata"] == {"op": "a"}
+    assert staged_payloads[0]["veracity"] == "stated"
+    assert staged_payloads[0]["valid_until"] == "2030-01-01"
+    assert staged_payloads[1]["content"] == "batch write two"
+    assert staged_payloads[1]["importance"] == 0.23
+    assert staged_payloads[1]["source"] == "op-source-b"
+    assert staged_payloads[1]["scope"] == "session"
+    assert staged_payloads[1]["metadata"] == {"op": "b"}
+    assert staged_payloads[1]["veracity"] == "inferred"
+    assert staged_payloads[1]["valid_until"] == "2030-02-02"
 
 
 @pytest.mark.parametrize("provider_module_name", [
@@ -219,7 +246,12 @@ def test_batch_staging_preserves_per_operation_authors(provider_module_name, mon
     "mnemosyne_hermes",
 ])
 def test_batch_staging_falls_back_to_batch_default_author(provider_module_name, monkeypatch):
-    """Ops without their own author fall back to the batch/env default."""
+    """Ops without their own author fall back to the batch/env default.
+
+    #926 (CodeRabbit F1/F4): asserting a non-default importance here as
+    well — a default-only assertion cannot distinguish a payload lookup
+    from an op-level lookup miss.
+    """
     module = _import_provider(provider_module_name)
     monkeypatch.setenv("MNEMOSYNE_AUTHOR_ID", HERMES_AUTHOR_ID)
     monkeypatch.setenv("MNEMOSYNE_AUTHOR_TYPE", HERMES_AUTHOR_TYPE)
@@ -233,12 +265,15 @@ def test_batch_staging_falls_back_to_batch_default_author(provider_module_name, 
     with _make_provider(module) as (provider, _db_path):
         payload = json.loads(provider._handle_batch({
             "operations": [
-                {"action": "remember", "content": "batch write one"},
+                {"action": "remember", "content": "batch write one",
+                 "importance": 0.77},
             ],
         }))
     assert payload["status"] == "staged"
     assert staged_payloads[0]["author_id"] == HERMES_AUTHOR_ID
     assert staged_payloads[0]["author_type"] == HERMES_AUTHOR_TYPE
+    assert staged_payloads[0]["content"] == "batch write one"
+    assert staged_payloads[0]["importance"] == 0.77
 
 
 @pytest.mark.parametrize("provider_module_name", [
@@ -288,6 +323,105 @@ def test_shared_remember_tool_arg_author_wins_over_env(provider_module_name, mon
         provider._surface_beam.conn.close()
 
 
+@pytest.mark.parametrize("provider_module_name", [
+    "hermes_memory_provider",
+    "mnemosyne_hermes",
+])
+def test_batch_staging_then_apply_pending_commits_content(
+    provider_module_name, monkeypatch, tmp_path
+):
+    """#926 (CodeRabbit F1) — the data-loss consequence, end to end.
+
+    At the reviewed head the staging loop read op-level fields, so every
+    staged batch write carried content='' / importance=0.5. On replay
+    ``_handle_apply_pending`` treats empty content as a dead record:
+    it records "empty content" and DELETES the file without writing
+    memory. This drives the real stage -> apply cycle against a temp
+    HERMES_HOME (only ``get_hermes_home`` is faked) and asserts the
+    memory actually lands.
+    """
+    import types
+
+    module = _import_provider(provider_module_name)
+    monkeypatch.setenv("MNEMOSYNE_AUTHOR_ID", HERMES_AUTHOR_ID)
+    monkeypatch.setenv("MNEMOSYNE_AUTHOR_TYPE", HERMES_AUTHOR_TYPE)
+    monkeypatch.setattr(module, "_write_approval_enabled", lambda: True)
+    fake_constants = types.ModuleType("hermes_constants")
+    setattr(fake_constants, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setitem(sys.modules, "hermes_constants", fake_constants)
+
+    with _make_provider(module) as (provider, db_path):
+        staged = json.loads(provider._handle_batch({
+            "operations": [
+                {"action": "remember", "content": "staged round trip content",
+                 "importance": 0.91, "author_id": "op-author",
+                 "author_type": "agent"},
+            ],
+        }))
+        assert staged["status"] == "staged", staged
+        pending_id = (
+            staged["pending_ids"][0]
+            if "pending_ids" in staged
+            else staged["staged"][0]["pending_id"]
+        )
+
+        applied = json.loads(provider._handle_apply_pending({
+            "pending_ids": [pending_id],
+        }))
+        assert applied["failed_count"] == 0, applied
+        assert applied["applied_count"] == 1, applied
+        mid = applied["applied"][0]["memory_id"]
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute(
+                "SELECT content, importance, author_id, author_type "
+                "FROM working_memory WHERE id = ?",
+                (mid,),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None, "apply_pending claimed success but wrote no row"
+        assert tuple(row) == (
+            "staged round trip content", 0.91, "op-author", "agent",
+        ), tuple(row)
+
+
+@pytest.mark.parametrize("provider_module_name", [
+    "hermes_memory_provider",
+    "mnemosyne_hermes",
+])
+def test_batch_staging_carries_memory_id_for_id_based_ops(
+    provider_module_name, monkeypatch
+):
+    """#926 (CodeRabbit F1): id-based ops keep their memory_id when staged.
+
+    The integration dict read ``op.get("memory_id")`` while the standalone
+    dict did not carry the key at all; both must read it from payload so
+    the staged record preserves the target id for the approval replay.
+    """
+    module = _import_provider(provider_module_name)
+    monkeypatch.setenv("MNEMOSYNE_AUTHOR_ID", HERMES_AUTHOR_ID)
+    monkeypatch.setattr(module, "_write_approval_enabled", lambda: True)
+    staged_payloads = []
+    monkeypatch.setattr(
+        module,
+        "_stage_pending_write",
+        lambda payload: staged_payloads.append(payload) or "pid-0",
+    )
+    with _make_provider(module) as (provider, _db_path):
+        payload = json.loads(provider._handle_batch({
+            "operations": [
+                {"action": "update", "memory_id": "wm-target-1",
+                 "content": "updated content", "importance": 0.42},
+            ],
+        }))
+    assert payload["status"] == "staged"
+    assert staged_payloads[0]["memory_id"] == "wm-target-1"
+    assert staged_payloads[0]["content"] == "updated content"
+    assert staged_payloads[0]["importance"] == 0.42
+
+
 def _import_provider(package: str):
     """Import a provider package from its own source root, mirroring the
     module-swap pattern in test_hermes_provider_parity.py.
@@ -335,20 +469,23 @@ def _import_provider(package: str):
     "hermes_memory_provider",
     "mnemosyne_hermes",
 ])
-def test_on_memory_write_mirror_stamps_author(provider_module_name, monkeypatch):
+@pytest.mark.parametrize("target", ["user", "session"])
+def test_on_memory_write_mirror_stamps_author(provider_module_name, target, monkeypatch):
     """The builtin-memory mirror write must carry the author on BOTH surfaces.
 
     CodeRabbit review finding on PR #926 (comment 4040483068's sibling, review
     5230504707): the sibling provider forwarded its write-identity kwargs in
     ``on_memory_write`` while ``mnemosyne_hermes`` did not, so the same
     ``builtin_memory_*`` write was stamped on one fork and NULL on the other.
+    Parametrized over both targets (user -> global, session -> session) so the
+    stamp is asserted on every branch of the scope mapping.
     """
     module = _import_provider(provider_module_name)
     monkeypatch.setenv("MNEMOSYNE_AUTHOR_ID", HERMES_AUTHOR_ID)
     monkeypatch.setenv("MNEMOSYNE_AUTHOR_TYPE", HERMES_AUTHOR_TYPE)
     with _make_provider(module) as (provider, db_path):
-        label = f"mirror write {provider_module_name}"
-        provider.on_memory_write("add", "user", label)
+        label = f"mirror write {provider_module_name} {target}"
+        provider.on_memory_write("add", target, label)
         conn = sqlite3.connect(str(db_path))
         try:
             row = conn.execute(

@@ -206,8 +206,15 @@ def _apply_one(
             extract=extract,
             metadata=metadata,
             veracity=veracity,
-            author_id=payload.get("author_id", default_author_id),
-            author_type=payload.get("author_type", default_author_type),
+            # #926 (CodeRabbit F3): validate_batch_operations() copies the
+            # whole op into payload, so an explicit `author_id: None` key
+            # would defeat the `dict.get(key, default)` form — the key IS
+            # present, so the resolution returned None and the resolved
+            # batch default was lost. `or` keeps the default for explicit
+            # nulls, matching the staging path's
+            # `payload.get("author_id") or batch_author_id`.
+            author_id=payload.get("author_id") or default_author_id,
+            author_type=payload.get("author_type") or default_author_type,
         )
         audit_events.append((
             "remember",

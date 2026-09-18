@@ -2385,18 +2385,24 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if _write_approval_enabled():
             staged = []
             for op in normalized:
+                # #926 (CodeRabbit F1): validate_batch_operations() wraps each
+                # op as {"index", "action", "payload": dict(op)} — every field
+                # must be read from payload, not the top-level op, or the
+                # staged record carries content='' and _handle_apply_pending
+                # deletes it without writing (data loss). Pre-existing bug in
+                # this dict from the write_approval gate lineage, fixed here.
                 payload = op["payload"]
                 pid = _stage_pending_write({
                     "tool": "mnemosyne_batch",
                     "action": op.get("action"),
-                    "content": op.get("content", ""),
-                    "importance": op.get("importance", 0.5),
-                    "source": op.get("source", "user"),
-                    "scope": op.get("scope", self._default_scope),
-                    "valid_until": op.get("valid_until"),
-                    "metadata": op.get("metadata"),
-                    "veracity": op.get("veracity"),
-                    "memory_id": op.get("memory_id"),
+                    "content": payload.get("content", ""),
+                    "importance": payload.get("importance", 0.5),
+                    "source": payload.get("source", "user"),
+                    "scope": payload.get("scope", self._default_scope),
+                    "valid_until": payload.get("valid_until"),
+                    "metadata": payload.get("metadata"),
+                    "veracity": payload.get("veracity"),
+                    "memory_id": payload.get("memory_id"),
                     "author_id": payload.get("author_id") or batch_author_id,
                     "author_type": payload.get("author_type") or batch_author_type,
                 })

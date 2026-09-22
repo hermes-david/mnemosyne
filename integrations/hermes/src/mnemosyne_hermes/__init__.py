@@ -2560,6 +2560,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 ledger_session_id = str(session_id or "").strip()
                 if ledger_session_id and not getattr(self, "_active_session_id", ""):
                     self._active_session_id = ledger_session_id
+                # #926 review: the automatic conversation capture must carry
+                # the resolved write identity, or every synced row lands with
+                # (author_id, author_type) = (NULL, NULL) regardless of the
+                # configured agent identity / env author. Resolved once per
+                # turn and reused for both role writes. Kept in strict parity
+                # with hermes_memory_provider.
+                identity_kwargs = self._write_identity_kwargs()
                 if "user" in self._sync_roles and user_content and len(user_content) > 5:
                     user_limit = _sync_turn_user_limit()
                     uc = user_content[:user_limit] if user_limit > 0 else user_content
@@ -2573,6 +2580,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         scope=self._default_scope,
                         extract_entities=True,
                         _write_policy_content=user_content,
+                        **identity_kwargs,
                     )
                     # Check for identity-significant signals in user content
                     if user_memory_id is not None:
@@ -2590,6 +2598,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         scope=self._default_scope,
                         extract_entities=True,
                         _write_policy_content=assistant_content,
+                        **identity_kwargs,
                     )
                 if durable_operation:
                     self._turn_count += 1
@@ -3875,10 +3884,16 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                             failed.append({"id": pid, "error": "empty content"})
                             _restore_pending_claim(claim_path, rp)
                             continue
-                        # #914 (PR A): replay the stamp captured at stage time
-                        # (payload author > provider identity at replay time),
-                        # never silently NULL.
-                        _identity = self._write_identity_kwargs()
+                        # #914 (PR A) + upstream #999: the redirected replay
+                        # reuses the LIVE beam, so its identity is
+                        # authoritative and must survive
+                        # (tests/test_936_scope_parity_audit.py::
+                        #  test_replay_keeps_the_live_beam_identity). The stamp
+                        # recorded at stage time is the FALLBACK, so an
+                        # unstamped live beam still replays an attributed row
+                        # instead of silently landing (NULL, NULL).
+                        _live_author_id = getattr(replay_beam, "author_id", None)
+                        _live_author_type = getattr(replay_beam, "author_type", None)
                         mid = replay_beam.remember(
                             content=c,
                             importance=float(p.get("importance", 0.5)),
@@ -3890,12 +3905,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                             metadata=p.get("metadata"),
                             veracity=clamp_veracity(p.get("veracity"), context="apply_pending"),
                             _write_policy=policy,
-                            author_id=(
-                                p.get("author_id") or _identity.get("author_id")
-                            ),
-                            author_type=(
-                                p.get("author_type") or _identity.get("author_type")
-                            ),
+                            author_id=_live_author_id or p.get("author_id"),
+                            author_type=_live_author_type or p.get("author_type"),
                         )
                         if mid is None:
                             failed.append({"id": pid, "error": "filtered"})

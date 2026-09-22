@@ -201,7 +201,7 @@ def test_batch_staging_preserves_per_operation_authors(provider_module_name, mon
     monkeypatch.setattr(
         module,
         "_stage_pending_write",
-        lambda payload: staged_payloads.append(payload) or f"pid-{len(staged_payloads)}",
+        lambda payload, **kwargs: staged_payloads.append(payload) or f"pid-{len(staged_payloads)}",
     )
     with _make_provider(module) as (provider, _db_path):
         payload = json.loads(provider._handle_batch({
@@ -260,7 +260,7 @@ def test_batch_staging_falls_back_to_batch_default_author(provider_module_name, 
     monkeypatch.setattr(
         module,
         "_stage_pending_write",
-        lambda payload: staged_payloads.append(payload) or "pid-0",
+        lambda payload, **kwargs: staged_payloads.append(payload) or "pid-0",
     )
     with _make_provider(module) as (provider, _db_path):
         payload = json.loads(provider._handle_batch({
@@ -407,7 +407,7 @@ def test_batch_staging_carries_memory_id_for_id_based_ops(
     monkeypatch.setattr(
         module,
         "_stage_pending_write",
-        lambda payload: staged_payloads.append(payload) or "pid-0",
+        lambda payload, **kwargs: staged_payloads.append(payload) or "pid-0",
     )
     with _make_provider(module) as (provider, _db_path):
         payload = json.loads(provider._handle_batch({

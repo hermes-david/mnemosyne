@@ -50,13 +50,24 @@ def test_author_params_are_appended_after_emit_event():
 
 
 def test_author_params_are_keyword_safe_by_position():
-    """Reaching author_id positionally requires 11 arguments, so any caller
-    passing a pre-existing argument positionally cannot bind to an author."""
+    """Reaching author_id positionally requires every preceding argument, so any
+    caller passing a pre-existing argument positionally cannot bind to an author.
+
+    The exact index is derived from the live signature rather than hard-coded:
+    upstream/main added `_write_kind` / `_write_policy` after `emit_event`, so a
+    fixed index would break on every unrelated signature addition. The invariant
+    that matters is "author params trail everything, and every pre-existing slot
+    stays ahead of them", asserted below.
+    """
     params = list(inspect.signature(BeamMemory.consolidate_to_episodic).parameters)
-    assert params.index("author_id") == 13, (
-        "author_id moved earlier than the appended slot; positional callers "
-        f"could mis-bind: index={params.index('author_id')}"
-    )
+    author_index = params.index("author_id")
+    assert params.index("emit_event") < author_index
+    # Nothing may be inserted after the author params: they stay the tail.
+    assert params[-2:] == ["author_id", "author_type"]
+    # Every pre-existing positional slot must sit ahead of the author params, so
+    # a caller written against the pre-#914 signature cannot bind to one.
+    for slot in FROZEN_PREFIX:
+        assert params.index(slot) < author_index
 
 
 # The same hazard applies to every signature the #914 work touched. Both

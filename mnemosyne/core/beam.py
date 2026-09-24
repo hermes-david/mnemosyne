@@ -7070,9 +7070,16 @@ class BeamMemory:
         the aggregated source-row authorship into the episodic INSERT.
         Pre-fix the INSERT copied `self.author_id` (the beam-level identity),
         dropping write-side stamps at consolidation. Callers (typically
-        `sleep()`) should pass the unanimous source-row author when every
-        source row agrees; `None` falls back to the beam identity (previous
-        behavior).
+        `sleep()`) pass the unanimous source-row author pair when every
+        source row agrees on BOTH fields; `None`/`None` falls back to the
+        beam identity pair (previous behavior).
+
+        The pair is resolved atomically (dplush review 5808202311): a caller
+        supplying only one of the two fields has supplied an identity it
+        cannot correlate with the other field's owner, so the incomplete pair
+        degrades to the beam identity pair rather than emitting a mixed
+        identity. Source attribution is inherited only when the full
+        `(author_id, author_type)` tuple is unanimous across the source rows.
         """
         # Public raw-content admission must precede classification, embedding,
         # event emission, and every SQL/vector mutation. Only the sleep pipeline
@@ -7168,10 +7175,28 @@ class BeamMemory:
             row_veracity = clamp_veracity(
                 veracity, context="consolidate_to_episodic.veracity"
             )
-        # Per-write author override: explicit kwargs win, beam identity is the
-        # fallback (pre-#914 the INSERT unconditionally copied self.author_id).
-        ep_author_id = author_id if author_id is not None else self.author_id
-        ep_author_type = author_type if author_type is not None else self.author_type
+        # Per-write author override: the two identity fields resolve as ONE
+        # unit (dplush review 5808202311). An explicit pair wins; when
+        # NEITHER kwarg is supplied the beam identity pair is used (pre-#914
+        # the INSERT unconditionally copied self.author_id). A HALF-supplied
+        # pair -- exactly one of the two -- cannot be correlated with the
+        # other field's owner, so pairing it with the beam's remaining field
+        # would emit a mixed identity (two halves from different identities)
+        # and misattribute the record. An incomplete pair therefore degrades
+        # to the beam pair as a whole, the same way sleep() degrades non-text
+        # author values to absent.
+        if (author_id is None) != (author_type is None):
+            logger.warning(
+                "consolidate_to_episodic: incomplete author pair "
+                "(author_id=%r, author_type=%r); using the beam identity pair "
+                "(%r, %r) instead of emitting a mixed identity",
+                author_id, author_type, self.author_id, self.author_type,
+            )
+            ep_author_id, ep_author_type = self.author_id, self.author_type
+        elif author_id is not None:
+            ep_author_id, ep_author_type = author_id, author_type
+        else:
+            ep_author_id, ep_author_type = self.author_id, self.author_type
 
         # Compute the embedding BEFORE the INSERT opens the write transaction.
         # embed() can be a network call (API embeddings, 30s timeout) or a
@@ -11800,12 +11825,18 @@ class BeamMemory:
                 [item.get("veracity") for item in items]
             )
 
-            # #914: aggregate per-row authorship into the summary. When
-            # EVERY source row carries the same author_id/author_type the
-            # stamp is restored on the episodic row; mixed or absent
-            # authorship falls back to the beam identity (self.author_id),
-            # matching the pre-fix behavior. Rows may carry non-text author
-            # values (legacy/foreign writes), so degrade those to absent.
+            # #914 + dplush review 5808202311: aggregate per-row authorship
+            # into the summary. The two identity fields are ONE unit: the
+            # source stamp is inherited ONLY when the full
+            # ``(author_id, author_type)`` tuple is identical -- unanimous --
+            # across EVERY source row. Aggregating the fields independently
+            # let a group of ``alice/human`` + ``bob/human`` emit
+            # ``<beam author_id>/human``: a pair whose halves come from
+            # different identities, misattributing the episodic record. On
+            # any tuple mismatch (including an absent field on any row) BOTH
+            # fields fall back to the beam identity together, matching the
+            # pre-fix behavior. Rows may carry non-text author values
+            # (legacy/foreign writes), so degrade those to absent.
             def _wm_author_text(item, key):
                 v = item.get(key)
                 if v is None:
@@ -11818,24 +11849,31 @@ class BeamMemory:
                     return ""
                 return v.strip()
 
-            _author_values = [
-                _wm_author_text(item, "author_id") for item in items
+            _author_pairs = [
+                (
+                    _wm_author_text(item, "author_id"),
+                    _wm_author_text(item, "author_type"),
+                )
+                for item in items
             ]
-            _authors = {v for v in _author_values if v}
-            # Unanimous only when EVERY row carries the same non-empty
-            # author; a sibling row with an absent author must not be
-            # attributed to the present rows' author (falls back below).
-            if len(_authors) == 1 and all(_author_values):
-                aggregated_author_id = _authors.pop() or None
+            # Unanimous only when EVERY row carries the same COMPLETE
+            # non-empty pair. A sibling row with an absent field, or any
+            # disagreement on either field, must not be attributed to the
+            # present rows' identity: the whole pair falls back below.
+            _unanimous_pair = (
+                _author_pairs[0]
+                if _author_pairs
+                and all(pair == _author_pairs[0] for pair in _author_pairs)
+                and all(_author_pairs[0])
+                else None
+            )
+            if _unanimous_pair is not None:
+                aggregated_author_id, aggregated_author_type = _unanimous_pair
             else:
+                # Pair-atomic fallback: never emit a source author_id beside
+                # an uncorrelated author_type. `None` for both lets
+                # consolidate_to_episodic resolve the beam identity pair.
                 aggregated_author_id = None
-            _author_type_values = [
-                _wm_author_text(item, "author_type") for item in items
-            ]
-            _author_types = {v for v in _author_type_values if v}
-            if len(_author_types) == 1 and all(_author_type_values):
-                aggregated_author_type = _author_types.pop() or None
-            else:
                 aggregated_author_type = None
 
             # --- Phase 1: heuristic conflict detection (no LLM) ---

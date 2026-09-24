@@ -7,8 +7,10 @@ Covers the two core bugs fixed on the dev branch:
      scoped).
   2. ``consolidate_to_episodic()`` and ``sleep()`` preserve the row-level
      author stamp instead of copying the beam identity: the source SELECT
-     fetches author columns and the summary inherits the unanimous
-     source-row author (mixed/absent falls back to beam identity).
+     fetches author columns and the summary inherits the source-row author
+     only when the full ``(author_id, author_type)`` tuple is unanimous
+     across the group (mixed/absent/partial falls back to the beam identity
+     pair as a unit).
 """
 
 import sqlite3
@@ -171,8 +173,9 @@ class TestSleepAuthorPreservation:
 
     def test_sleep_missing_sibling_author_type_not_attributed_to_present_type(self, temp_db):
         """author_id unanimous but a sibling row's author_type is absent:
-        the type must fall back to the beam identity, not the present
-        row's type."""
+        the tuple is not unanimous, so BOTH fields fall back to the beam
+        identity pair — never a source author_id beside an uncorrelated
+        author_type (dplush review 5808202311)."""
         beam = BeamMemory(
             session_id="s1", db_path=temp_db,
             author_id="maintenance", author_type="bot",
@@ -184,11 +187,12 @@ class TestSleepAuthorPreservation:
 
         beam.sleep()
 
-        assert _ep_author(temp_db) == ("alice", "bot")
+        assert _ep_author(temp_db) == ("maintenance", "bot")
 
-    def test_sleep_mixed_author_type_falls_back_author_id_only(self, temp_db):
-        """author_id unanimous but author_type mixed: id is preserved,
-        type falls back to beam identity independently."""
+    def test_sleep_mixed_author_type_falls_back_both_fields(self, temp_db):
+        """author_id unanimous but author_type mixed: the tuple is not
+        unanimous, so the pair falls back to the beam identity as a unit
+        (previously this emitted the mixed pair ``alice/bot``)."""
         beam = BeamMemory(
             session_id="s1", db_path=temp_db,
             author_id="maintenance", author_type="bot",
@@ -200,4 +204,4 @@ class TestSleepAuthorPreservation:
 
         beam.sleep()
 
-        assert _ep_author(temp_db) == ("alice", "bot")
+        assert _ep_author(temp_db) == ("maintenance", "bot")

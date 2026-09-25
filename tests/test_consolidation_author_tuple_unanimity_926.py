@@ -153,6 +153,26 @@ GROUP_CASES = [
     ),
 ]
 
+# The alien-session maintenance path (sleep_all_sessions) is a second
+# consolidation path; it must obey the same unanimity contract. Its cases
+# assert the EXACT expected pair, not merely attributability: a regression
+# that always stamped the caller's pair would stay "attributable" for the
+# unanimous group and still be caught here.
+SLEEP_ALL_SESSION_CASES = [
+    pytest.param(
+        [("a1", "alpha fact", "conversation", "alice", "human"),
+         ("a2", "beta fact", "conversation", "bob", "human")],
+        BEAM_PAIR,
+        id="mixed-author-ids-same-author-type",
+    ),
+    pytest.param(
+        [("a1", "alpha fact", "conversation", "alice", "human"),
+         ("a2", "beta fact", "conversation", "alice", "human")],
+        ALICE,
+        id="unanimous-pair-inherited",
+    ),
+]
+
 
 class TestTupleUnanimityRegression:
     def test_distinct_author_ids_same_type_do_not_produce_a_mixed_record(
@@ -194,21 +214,23 @@ class TestTupleUnanimityRegression:
         _assert_no_mixed_episodic_rows(temp_db, [(r[3], r[4]) for r in rows], BEAM_PAIR)
         assert emitted == expected
 
-    def test_sleep_all_sessions_never_emits_a_mixed_identity(self, temp_db):
+    @pytest.mark.parametrize("rows,expected", SLEEP_ALL_SESSION_CASES)
+    def test_sleep_all_sessions_never_emits_a_mixed_identity(
+        self, temp_db, rows, expected
+    ):
         """The alien-session maintenance path (sleep_all_sessions) is a
-        second consolidation path; it must obey the same invariant."""
+        second consolidation path; it must obey the same invariant, and it
+        must inherit the unanimous source pair (not merely avoid a mix)."""
         caller = _beam(temp_db, session_id="caller")
-        _seed_old_wm(caller, [
-            ("a1", "alpha fact", "conversation", "alice", "human"),
-            ("a2", "beta fact", "conversation", "bob", "human"),
-        ], session_id="s1")
+        _seed_old_wm(caller, rows, session_id="s1")
 
         caller.sleep_all_sessions()
 
         emitted = _ep_author(temp_db)
-        _assert_attributable(emitted, [ALICE, BOB], BEAM_PAIR)
-        _assert_no_mixed_episodic_rows(temp_db, [ALICE, BOB], BEAM_PAIR)
-        assert emitted == BEAM_PAIR
+        source_pairs = [(r[3], r[4]) for r in rows]
+        _assert_attributable(emitted, source_pairs, BEAM_PAIR)
+        _assert_no_mixed_episodic_rows(temp_db, source_pairs, BEAM_PAIR)
+        assert emitted == expected
 
 
 class TestConsolidateToEpisodicPairAtomicity:
@@ -256,18 +278,32 @@ class TestConsolidateToEpisodicPairAtomicity:
             for record in caplog.records
         ), "the incomplete-pair degradation must be observable in the log"
 
-    @pytest.mark.parametrize("kwargs", [
-        pytest.param({}, id="no-author-kwargs"),
-        pytest.param({"author_id": None, "author_type": None}, id="explicit-nones"),
-        pytest.param({"author_id": "alice"}, id="author-id-only"),
-        pytest.param({"author_type": "human"}, id="author-type-only"),
-        pytest.param({"author_id": "alice", "author_type": "human"}, id="full-pair"),
-        pytest.param({"author_id": "bob", "author_type": "human"}, id="other-full-pair"),
+    @pytest.mark.parametrize("kwargs,expected", [
+        pytest.param({}, BEAM_PAIR, id="no-author-kwargs"),
+        pytest.param({"author_id": None, "author_type": None}, BEAM_PAIR,
+                     id="explicit-nones"),
+        pytest.param({"author_id": "alice"}, BEAM_PAIR, id="author-id-only"),
+        pytest.param({"author_type": "human"}, BEAM_PAIR, id="author-type-only"),
+        pytest.param({"author_id": "alice", "author_type": "human"}, ALICE,
+                     id="full-pair"),
+        pytest.param({"author_id": "bob", "author_type": "human"}, BOB,
+                     id="other-full-pair"),
     ])
-    def test_no_kwarg_combination_emits_a_mixed_identity(self, temp_db, kwargs):
+    def test_no_kwarg_combination_emits_a_mixed_identity(
+        self, temp_db, kwargs, expected
+    ):
+        """Every kwarg combination must emit the EXACT expected pair.
+
+        Attributability alone is too weak: a regression that always stamped
+        the beam pair would keep passing the "not a mix" check for every
+        case, and one that always used the caller's pair would pass the
+        full-pair cases. The expected-pair column pins each case, including
+        the two complete-pair cases that must be inherited verbatim.
+        """
         beam = _beam(temp_db)
         eid = beam.consolidate_to_episodic("summary", ["wm1"], **kwargs)
         row = tuple(beam.conn.execute(
             "SELECT author_id, author_type FROM episodic_memory WHERE id = ?", (eid,)
         ).fetchone())
         _assert_attributable(row, [ALICE, BOB], BEAM_PAIR)
+        assert row == expected
